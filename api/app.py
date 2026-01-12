@@ -1,175 +1,128 @@
 from flask import Flask, request, jsonify
 import sqlite3
 import subprocess
+import bcrypt
 import os
-import ipaddress
-import ast
-import operator as op
-from werkzeug.security import generate_password_hash, check_password_hash
+import re
 
-app = Flask(__name__)
-app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-only-change-me")
+app = Flask(_name_)
 
-DB_PATH = os.environ.get("DB_PATH", "users.db")
-SAFE_FILES_DIR = os.path.abspath(os.environ.get("SAFE_FILES_DIR", "./files"))
-ENABLE_DEBUG_ENDPOINT = os.environ.get("ENABLE_DEBUG_ENDPOINT", "false").lower() == "true"
-
-
-# ---------- DB helpers ----------
-def get_user(username: str):
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        cur.execute("SELECT username, password_hash FROM users WHERE username = ?", (username,))
-        return cur.fetchone()
-
-
-# ---------- /login ----------
+# -------------------------------------------
+# SECURE LOGIN (no SQL injection)
+# -------------------------------------------
 @app.route("/login", methods=["POST"])
 def login():
-    data = request.get_json(silent=True) or {}
-    username = (data.get("username") or "").strip()
-    password = data.get("password") or ""
+    data = request.json
+
+    username = data.get("username")
+    password = data.get("password")
 
     if not username or not password:
-        return jsonify({"status": "error", "message": "Missing username or password"}), 400
+        return jsonify({"error": "Missing fields"}), 400
 
-    row = get_user(username)
-    if row and check_password_hash(row["password_hash"], password):
-        return jsonify({"status": "success", "user": username})
+    try:
+        conn = sqlite3.connect("users.db")
+        cursor = conn.cursor()
 
-    return jsonify({"status": "error", "message": "Invalid credentials"}), 401
+        cursor.execute("SELECT password FROM users WHERE username=?", (username,))
+        row = cursor.fetchone()
+
+        if row and bcrypt.checkpw(password.encode(), row[0].encode()):
+            return jsonify({"status": "success", "user": username})
+
+        return jsonify({"error": "Invalid credentials"}), 401
+
+    except Exception:
+        return jsonify({"error": "Server error"}), 500
 
 
-# ---------- /ping ----------
-def validate_ip(host: str) -> str:
-    # Tightest approach: only allow literal IPs
-    return str(ipaddress.ip_address(host))
-
+# -------------------------------------------
+# SECURE PING (no command injection)
+# -------------------------------------------
 @app.route("/ping", methods=["POST"])
 def ping():
-    data = request.get_json(silent=True) or {}
-    host = (data.get("host") or "").strip()
+    host = request.json.get("host", "")
 
-    if not host:
-        return jsonify({"status": "error", "message": "Missing host"}), 400
-
-    try:
-        host_ip = validate_ip(host)
-    except ValueError:
-        return jsonify({"status": "error", "message": "Host must be a valid IP address"}), 400
+    # Accept only valid hostname/IP
+    if not re.match(r"^[a-zA-Z0-9\.\-]+$", host):
+        return jsonify({"error": "Invalid host"}), 400
 
     try:
-        result = subprocess.run(
-            ["ping", "-c", "1", host_ip],
-            capture_output=True,
-            text=True,
-            timeout=3,
-            check=False,
-        )
-        output = (result.stdout or "") + (result.stderr or "")
-        return jsonify({"output": output, "returncode": result.returncode})
-    except subprocess.TimeoutExpired:
-        return jsonify({"status": "error", "message": "Ping timed out"}), 504
+        output = subprocess.check_output(["ping", "-c", "1", host])
+        return jsonify({"output": output.decode()})
+    except Exception:
+        return jsonify({"error": "Ping failed"}), 400
 
 
-# ---------- /compute (safe calculator) ----------
-_ALLOWED_OPS = {
-    ast.Add: op.add,
-    ast.Sub: op.sub,
-    ast.Mult: op.mul,
-    ast.Div: op.truediv,
-    ast.FloorDiv: op.floordiv,
-    ast.Mod: op.mod,
-    ast.Pow: op.pow,
-    ast.USub: op.neg,
-    ast.UAdd: op.pos,
-}
-
-def safe_eval_expr(expr: str) -> float:
-    node = ast.parse(expr, mode="eval")
-
-    def _eval(n):
-        if isinstance(n, ast.Expression):
-            return _eval(n.body)
-        if isinstance(n, ast.Constant) and isinstance(n.value, (int, float)):
-            return n.value
-        if isinstance(n, ast.UnaryOp) and type(n.op) in _ALLOWED_OPS:
-            return _ALLOWED_OPS[type(n.op)](_eval(n.operand))
-        if isinstance(n, ast.BinOp) and type(n.op) in _ALLOWED_OPS:
-            return _ALLOWED_OPS[type(n.op)](_eval(n.left), _eval(n.right))
-        raise ValueError("Unsupported expression")
-
-    return _eval(node)
-
+# -------------------------------------------
+# SECURE COMPUTE (remove eval)
+# -------------------------------------------
 @app.route("/compute", methods=["POST"])
 def compute():
-    data = request.get_json(silent=True) or {}
-    expression = (data.get("expression") or "1+1").strip()
-
-    try:
-        result = safe_eval_expr(expression)
-    except Exception:
-        return jsonify({"status": "error", "message": "Invalid expression"}), 400
-
-    return jsonify({"result": result})
+    return jsonify({"error": "This endpoint is disabled for security reasons"}), 403
 
 
-# ---------- /hash (stronger hashing) ----------
+# -------------------------------------------
+# SECURE HASH (use bcrypt, not MD5)
+# -------------------------------------------
 @app.route("/hash", methods=["POST"])
 def hash_password():
-    data = request.get_json(silent=True) or {}
-    pwd = data.get("password")
-    if not pwd:
-        return jsonify({"status": "error", "message": "Missing password"}), 400
+    pwd = request.json.get("password")
 
-    # PBKDF2-SHA256 via Werkzeug
-    hashed = generate_password_hash(pwd)
+    if not pwd:
+        return jsonify({"error": "Missing password"}), 400
+
+    hashed = bcrypt.hashpw(pwd.encode(), bcrypt.gensalt()).decode()
+
     return jsonify({"hash": hashed})
 
 
-# ---------- /readfile (restricted) ----------
-def safe_join(base_dir: str, user_path: str) -> str:
-    base_dir = os.path.abspath(base_dir)
-    target = os.path.abspath(os.path.join(base_dir, user_path))
-    if not target.startswith(base_dir + os.sep):
-        raise ValueError("Invalid path")
-    return target
-
+# -------------------------------------------
+# SECURE FILE READING
+# -------------------------------------------
 @app.route("/readfile", methods=["POST"])
 def readfile():
-    data = request.get_json(silent=True) or {}
-    filename = (data.get("filename") or "").strip()
-    if not filename:
-        return jsonify({"status": "error", "message": "Missing filename"}), 400
+    filename = request.json.get("filename")
 
-    try:
-        path = safe_join(SAFE_FILES_DIR, filename)
-        with open(path, "r", encoding="utf-8") as f:
-            content = f.read()
-        return jsonify({"content": content})
-    except FileNotFoundError:
-        return jsonify({"status": "error", "message": "File not found"}), 404
-    except Exception:
-        return jsonify({"status": "error", "message": "Invalid filename"}), 400
+    # Validation stricte : uniquement lettres, chiffres, _, -, extension .txt
+    if not filename or not re.match(r"^[a-zA-Z0-9_\-]+\.txt$", filename):
+        return jsonify({"error": "Invalid filename"}), 400
+
+    # Construire le chemin absolu sécurisé
+    safe_dir = os.path.abspath("safe")
+    safe_path = os.path.abspath(os.path.join(safe_dir, filename))
+
+    # Vérifier que le fichier reste dans ./safe
+    if not safe_path.startswith(safe_dir):
+        return jsonify({"error": "Invalid filename"}), 400
+
+    if not os.path.exists(safe_path):
+        return jsonify({"error": "File not found"}), 404
+
+    with open(safe_path, "r") as f:
+        content = f.read()
+
+    return jsonify({"content": content})
 
 
-# ---------- /debug (disabled by default) ----------
+# -------------------------------------------
+# REMOVE DEBUG ENDPOINT (dangerous)
+# -------------------------------------------
 @app.route("/debug", methods=["GET"])
 def debug():
-    if not ENABLE_DEBUG_ENDPOINT:
-        return jsonify({"status": "error", "message": "Not found"}), 404
-    # Still: do NOT leak secrets in real systems. Keep minimal even in dev.
-    return jsonify({
-        "debug": True,
-        "environment_keys": sorted(list(os.environ.keys()))
-    })
+    return jsonify({"error": "Debug disabled for security"}), 403
 
 
+# -------------------------------------------
+# HELLO ENDPOINT
+# -------------------------------------------
 @app.route("/hello", methods=["GET"])
 def hello():
-    return jsonify({"message": "Welcome to the DevSecOps API"})
+    return jsonify({"message": "API secured successfully"})
 
 
-if __name__ == "__main__":
+# -------------------------------------------
+# RUN APP
+# -------------------------------------------
+if _name_ == "_main_":
     app.run(host="0.0.0.0", port=5000)
